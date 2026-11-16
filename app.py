@@ -1,365 +1,201 @@
 
-import streamlit as st
-import pandas as pd
-import ccxt
-
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-st.set_page_config(
-    page_title="Arb Desk Mobile v0.8",
-    page_icon="💱",
-    layout="wide"
-)
+import ccxt
+import pandas as pd
+import requests
+import streamlit as st
 
-st.title("💱 Arb Desk Mobile v0.8")
-st.caption("Arbitragem USDT/BRL | Monitoramento e simulação")
-
-st.warning(
-    "Somente simulação. O aplicativo não executa compras, "
-    "vendas ou transferências reais."
-)
+st.set_page_config(page_title="Arb Desk Mobile v0.9", page_icon="💱", layout="wide")
+st.title("💱 Arb Desk Mobile v0.9")
+st.caption("USDT/BRL • Arbitragem entre corretoras • Simulação, sem ordens reais")
+st.warning("Preços podem mudar durante a transferência. Um resultado estimado positivo não garante lucro.")
 
 EXCHANGES = {
-    "Mercado Bitcoin": "mercado",
-    "Foxbit": "foxbit",
-    "Kraken": "kraken",
-    "Coinbase": "coinbase",
-    "Bitget": "bitget",
-    "KuCoin": "kucoin",
-    "MEXC": "mexc",
-    "Bybit": "bybit",
+    "Foxbit": "foxbit", "Bitget": "bitget", "Mercado Bitcoin": "mercado",
+    "Kraken": "kraken", "Coinbase": "coinbase", "KuCoin": "kucoin",
+    "MEXC": "mexc", "Bybit": "bybit",
 }
 
 with st.expander("⚙️ Configurações", expanded=True):
-
-    capital = st.number_input(
-        "Capital inicial (R$)",
-        min_value=100.0,
-        value=5000.0,
-        step=100.0
-    )
-
-    fee_buy = st.number_input(
-        "Taxa de compra (%)",
-        min_value=0.0,
-        value=0.1,
-        step=0.05
-    )
-
-    fee_sell = st.number_input(
-        "Taxa de venda (%)",
-        min_value=0.0,
-        value=0.1,
-        step=0.05
-    )
-
-    transfer_fee = st.number_input(
-        "Taxa de transferência (USDT)",
-        min_value=0.0,
-        value=1.0,
-        step=0.1
-    )
-
-    min_profit = st.number_input(
-        "Lucro mínimo (R$)",
-        min_value=0.0,
-        value=10.0,
-        step=5.0
-    )
-
-    selected = st.multiselect(
-        "Corretoras",
-        list(EXCHANGES.keys()),
-        default=["Mercado Bitcoin", "Foxbit"]
-    )
-
-    show_all = st.checkbox(
-        "Mostrar operações mesmo sem lucro",
-        value=False
-    )
-
-st.info(
-    "Esta versão consulta USDT/BRL. "
-    "Corretoras sem esse mercado serão identificadas no diagnóstico."
-)
+    capital = st.number_input("Capital inicial (R$)", min_value=100.0, value=5000.0, step=100.0)
+    buy_fee = st.number_input("Taxa de compra (%)", min_value=0.0, max_value=10.0, value=0.10, step=0.05)
+    sell_fee = st.number_input("Taxa de venda (%)", min_value=0.0, max_value=10.0, value=0.10, step=0.05)
+    network_fee = st.number_input("Taxa de envio (USDT)", min_value=0.0, value=1.0, step=0.1)
+    withdrawal_fee = st.number_input("Custo adicional de retirada (R$)", min_value=0.0, value=0.0, step=1.0)
+    minimum_profit = st.number_input("Alerta a partir de lucro estimado (R$)", min_value=0.0, value=20.0, step=5.0)
+    selected = st.multiselect("Corretoras", list(EXCHANGES), default=["Foxbit", "Bitget", "Mercado Bitcoin"])
+    show_losses = st.checkbox("Mostrar também operações com prejuízo", value=True)
 
 
-def simulate_book(levels, amount, buy=False):
+def simulate_book(levels, amount, is_buy):
     remaining = float(amount)
     received = 0.0
-
     for level in levels:
-        price = float(level[0])
-        quantity = float(level[1])
-
-        if price <= 0 or quantity <= 0:
+        price, volume = float(level[0]), float(level[1])
+        if price <= 0 or volume <= 0:
             continue
-
-        if buy:
-            spent = min(remaining, price * quantity)
-            received += spent / price
-            remaining -= spent
+        if is_buy:
+            used = min(remaining, price * volume)
+            received += used / price
+            remaining -= used
         else:
-            sold = min(remaining, quantity)
-            received += sold * price
-            remaining -= sold
-
-        if remaining < 0.00000001:
+            used = min(remaining, volume)
+            received += used * price
+            remaining -= used
+        if remaining <= 1e-8:
             break
-
     return received, remaining
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_exchange(name):
-
-    exchange_id = EXCHANGES[name]
-
+def fetch_market(name):
     try:
-        exchange_class = getattr(ccxt, exchange_id, None)
-
-        if exchange_class is None:
-            return None, "Integração indisponível no CCXT"
-
-        exchange = exchange_class({
-            "enableRateLimit": True,
-            "timeout": 8000,
-        })
-
-        exchange.load_markets()
-
+        cls = getattr(ccxt, EXCHANGES[name], None)
+        if cls is None:
+            return None, "Integração CCXT não disponível"
+        ex = cls({"enableRateLimit": True, "timeout": 7000})
+        ex.load_markets()
         symbol = "USDT/BRL"
-
-        if symbol not in exchange.markets:
+        if symbol not in ex.markets:
             return None, "USDT/BRL não listado"
-
-        market = exchange.market(symbol)
-
-        if market.get("spot") is False:
-            return None, "Mercado não é spot"
-
-        if market.get("active") is False:
-            return None, "Mercado inativo"
-
-        book = exchange.fetch_order_book(
-            symbol,
-            limit=20
-        )
-
-        asks = book.get("asks") or []
-        bids = book.get("bids") or []
-
+        market = ex.market(symbol)
+        if market.get("spot") is False or market.get("active") is False:
+            return None, "Mercado spot inativo ou indisponível"
+        book = ex.fetch_order_book(symbol, limit=20)
+        asks, bids = book.get("asks") or [], book.get("bids") or []
         if not asks or not bids:
             return None, "Livro de ofertas vazio"
-
-        ask = float(asks[0][0])
-        bid = float(bids[0][0])
-
+        ask, bid = float(asks[0][0]), float(bids[0][0])
         if ask <= 0 or bid <= 0:
             return None, "Preços inválidos"
+        return {"ask": ask, "bid": bid, "asks": asks, "bids": bids}, "Conectada"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:105]}"
 
-        return {
-            "ask": ask,
-            "bid": bid,
-            "asks": asks,
-            "bids": bids,
-        }, "Conectada"
 
-    except Exception as error:
-        message = str(error).replace("\n", " ")
-        return None, (
-            type(error).__name__ + ": " + message[:130]
+def telegram_config():
+    try:
+        return st.secrets.get("TELEGRAM_BOT_TOKEN", ""), st.secrets.get("TELEGRAM_CHAT_ID", "")
+    except Exception:
+        return "", ""
+
+
+def send_telegram(message):
+    token, chat_id = telegram_config()
+    if not token or not chat_id:
+        return False, "Configure TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nos Secrets do Streamlit."
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": str(chat_id), "text": message}, timeout=8,
         )
+        response.raise_for_status()
+        return True, "Mensagem enviada."
+    except requests.RequestException as exc:
+        return False, f"Falha no Telegram: {type(exc).__name__}"
 
 
-if st.button("🔄 Atualizar cotações", type="primary"):
-    fetch_exchange.clear()
+if st.button("🔄 Consultar preços agora", type="primary"):
+    fetch_market.clear()
     st.rerun()
 
-
 st.subheader("🌐 Diagnóstico das conexões")
-
-quotes = {}
-diagnostics = []
-
+quotes, diagnostics = {}, []
 if selected:
-
     progress = st.progress(0)
-    status_text = st.empty()
-
-    with ThreadPoolExecutor(
-        max_workers=min(4, len(selected))
-    ) as executor:
-
-        futures = {
-            executor.submit(fetch_exchange, name): name
-            for name in selected
-        }
-
-        for index, future in enumerate(
-            as_completed(futures), start=1
-        ):
-
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as pool:
+        futures = {pool.submit(fetch_market, name): name for name in selected}
+        for count, future in enumerate(as_completed(futures), 1):
             name = futures[future]
-
             try:
-                quote, status = future.result()
-            except Exception as error:
-                quote = None
-                status = type(error).__name__
-
-            diagnostics.append({
-                "Corretora": name,
-                "Situação": status,
-            })
-
-            if quote:
-                quotes[name] = quote
-
-            progress.progress(index / len(selected))
-            status_text.write(
-                f"Consultas concluídas: {index}/{len(selected)}"
-            )
-
+                data, status = future.result()
+            except Exception as exc:
+                data, status = None, type(exc).__name__
+            diagnostics.append({"Corretora": name, "Situação": status})
+            if data:
+                quotes[name] = data
+            progress.progress(count / len(selected))
 else:
     st.info("Selecione pelo menos uma corretora.")
 
-c1, c2 = st.columns(2)
-
-c1.metric("Conectadas", len(quotes))
-c2.metric("Selecionadas", len(selected))
-
+left, right = st.columns(2)
+left.metric("Conectadas", len(quotes))
+right.metric("Selecionadas", len(selected))
 if diagnostics:
-    st.dataframe(
-        pd.DataFrame(diagnostics),
-        hide_index=True,
-        use_container_width=True
-    )
+    st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
 
-
-st.subheader("💰 Preços do USDT em reais")
-
-price_rows = []
-
-for name, quote in quotes.items():
-
-    price_rows.append({
-        "Corretora": name,
-        "Comprar USDT (R$)": quote["ask"],
-        "Vender USDT (R$)": quote["bid"],
-    })
-
-if price_rows:
-    st.dataframe(
-        pd.DataFrame(price_rows),
-        hide_index=True,
-        use_container_width=True
-    )
+st.subheader("💵 Preços USDT/BRL")
+if quotes:
+    st.dataframe(pd.DataFrame([
+        {"Corretora": name, "Comprar (R$)": q["ask"], "Vender (R$)": q["bid"]}
+        for name, q in quotes.items()
+    ]), hide_index=True, use_container_width=True)
 else:
-    st.info(
-        "Nenhuma cotação USDT/BRL disponível "
-        "nas corretoras selecionadas."
-    )
-
-
-st.subheader("📊 Oportunidades de arbitragem")
+    st.info("Nenhum livro USDT/BRL disponível nesta consulta.")
 
 results = []
-
-for buy_name, buy_quote in quotes.items():
-
-    quantity, unspent = simulate_book(
-        buy_quote["asks"],
-        capital,
-        buy=True
-    )
-
+for buyer, b in quotes.items():
+    quantity, unspent = simulate_book(b["asks"], capital, True)
     if unspent > 0.01:
         continue
-
-    quantity *= (1 - fee_buy / 100)
-    quantity -= transfer_fee
-
-    if quantity <= 0:
+    sent = quantity * (1 - buy_fee / 100) - network_fee
+    if sent <= 0:
         continue
-
-    for sell_name, sell_quote in quotes.items():
-
-        if buy_name == sell_name:
+    for seller, s in quotes.items():
+        if buyer == seller:
             continue
-
-        proceeds, unsold = simulate_book(
-            sell_quote["bids"],
-            quantity,
-            buy=False
-        )
-
-        if unsold > 0.000001:
+        proceeds, unsold = simulate_book(s["bids"], sent, False)
+        if unsold > 1e-6:
             continue
-
-        final_brl = proceeds * (1 - fee_sell / 100)
-
-        profit = final_brl - capital
-        percent = profit / capital * 100
-
+        net_brl = proceeds * (1 - sell_fee / 100) - withdrawal_fee
+        profit = net_brl - capital
         results.append({
-            "Comprar": buy_name,
-            "Vender": sell_name,
-            "USDT transferido": round(quantity, 4),
-            "Receber (R$)": round(final_brl, 2),
-            "Lucro estimado (R$)": round(profit, 2),
-            "Retorno (%)": round(percent, 3),
+            "Comprar": buyer, "Vender": seller,
+            "Preço compra": b["ask"], "Preço venda": s["bid"],
+            "USDT enviado": round(sent, 4), "Receber BRL": round(net_brl, 2),
+            "Lucro estimado": round(profit, 2), "Retorno (%)": round(100 * profit / capital, 3),
         })
 
-
+st.subheader("📊 Comprar → Transferir → Vender")
 if results:
-
-    df = pd.DataFrame(results).sort_values(
-        "Lucro estimado (R$)",
-        ascending=False
-    )
-
+    df = pd.DataFrame(results).sort_values("Lucro estimado", ascending=False)
     best = df.iloc[0]
-
-    st.metric(
-        "Melhor resultado estimado",
-        f"R$ {best['Lucro estimado (R$)']:.2f}"
-    )
-
-    if not show_all:
-        df = df[df["Lucro estimado (R$)"] >= min_profit]
-
-    if df.empty:
-        st.info(
-            "Nenhuma oportunidade superou o lucro mínimo."
+    st.metric("Melhor resultado estimado", f"R$ {best['Lucro estimado']:.2f}")
+    st.write(f"**Comprar:** {best['Comprar']}  |  **Vender:** {best['Vender']}")
+    st.write(f"**Preço de compra:** R$ {best['Preço compra']:.4f}  |  **Preço de venda:** R$ {best['Preço venda']:.4f}")
+    st.write(f"**USDT após taxas de compra e envio:** {best['USDT enviado']:.4f}")
+    st.write(f"**Recebimento final estimado:** R$ {best['Receber BRL']:.2f}")
+    visible = df if show_losses else df[df["Lucro estimado"] >= 0]
+    if not visible.empty:
+        st.dataframe(visible, hide_index=True, use_container_width=True)
+    eligible = df[df["Lucro estimado"] >= minimum_profit]
+    if not eligible.empty:
+        st.success(f"{len(eligible)} comparação(ões) acima do lucro mínimo de R$ {minimum_profit:.2f}.")
+        alert = eligible.iloc[0]
+        message = (
+            "ARB DESK — ALERTA SIMULADO\n"
+            f"Comprar USDT: {alert['Comprar']}\n"
+            f"Vender USDT: {alert['Vender']}\n"
+            f"Capital: R$ {capital:.2f}\n"
+            f"Lucro líquido estimado: R$ {alert['Lucro estimado']:.2f}\n"
+            "Não é ordem de negociação. Verifique rede, saques, depósitos e preços."
         )
+        if st.button("📨 Enviar melhor oportunidade ao Telegram"):
+            ok, info = send_telegram(message)
+            (st.success if ok else st.error)(info)
     else:
-        st.dataframe(
-            df,
-            hide_index=True,
-            use_container_width=True
-        )
-
+        st.info("Nenhuma oportunidade atingiu o lucro mínimo nesta consulta.")
 else:
-    st.info(
-        "São necessárias duas corretoras com USDT/BRL "
-        "e liquidez suficiente para calcular a arbitragem."
-    )
+    st.info("São necessárias pelo menos duas corretoras com USDT/BRL e liquidez suficiente.")
 
-
-st.caption(
-    "Consulta UTC: " +
-    datetime.now(timezone.utc).strftime(
-        "%d/%m/%Y %H:%M:%S"
-    )
-)
-
+st.caption("Horário UTC: " + datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S"))
 st.error(
-    "Os resultados não garantem lucro. "
-    "O sistema ainda não verifica disponibilidade de "
-    "depósitos e saques, redes compatíveis, taxas reais "
-    "de transferência, impostos, tempo de envio ou "
-    "mudanças de preço durante a operação. "
-    "Alertas Telegram ainda não estão ativos."
+    "Limitações: taxas de negociação e rede são estimativas configuradas pelo usuário; "
+    "não há verificação de depósitos/saques, compatibilidade de redes, transferências, "
+    "slippage durante o envio, tributos ou execução real. "
+    "O Telegram só envia mensagens quando o botão é pressionado; "
+    "não há monitoramento contínuo em segundo plano."
 )
