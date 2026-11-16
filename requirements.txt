@@ -1,6 +1,7 @@
-treamlit>=1.35,<2
-pandas>=2.0,<3
-ccxt>=4.4,<5
-requests>=2.31,<3
+streamlit
+pandas
+ccxt
+requests
+
 
 
