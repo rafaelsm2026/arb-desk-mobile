@@ -1,7 +1,8 @@
 
 import streamlit as st
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(
     page_title="Arb Desk Mobile",
@@ -10,10 +11,10 @@ st.set_page_config(
 )
 
 st.title("📈 ARB DESK MOBILE")
-st.caption("Arbitragem de criptomoedas | Simulação")
+st.caption("Versão 0.3 | Monitoramento e simulação")
 
 st.warning(
-    "Modo teste: nenhuma compra ou venda real será realizada."
+    "MODO TESTE — Nenhuma operação real é executada."
 )
 
 capital = st.number_input(
@@ -21,12 +22,6 @@ capital = st.number_input(
     min_value=100.0,
     value=1000.0,
     step=100.0
-)
-
-st.caption(
-    "O capital está em USDT. "
-    "A conversão de R$ 5.000 para USDT "
-    "será implementada posteriormente."
 )
 
 taxa_compra = st.number_input(
@@ -43,136 +38,200 @@ taxa_venda = st.number_input(
     step=0.01
 )
 
-def consultar_json(url, params, corretora):
+st.caption(
+    "Os valores estão em USDT. "
+    "O capital inicial de R$ 5.000 ainda não "
+    "é convertido automaticamente."
+)
+
+MOEDAS = {
+    "BTC": {
+        "Kraken": "XBTUSDT",
+        "Coinbase": "BTC-USDT"
+    },
+    "ETH": {
+        "Kraken": "ETHUSDT",
+        "Coinbase": "ETH-USDT"
+    },
+    "SOL": {
+        "Kraken": "SOLUSDT",
+        "Coinbase": "SOL-USDT"
+    }
+}
+
+def buscar_json(url, params, nome):
     try:
         resposta = requests.get(
             url,
             params=params,
             timeout=12,
             headers={
-                "User-Agent": "ArbDeskMobile/0.1",
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "User-Agent": "ArbDeskMobile/0.3"
             }
         )
 
         if resposta.status_code != 200:
             raise ValueError(
-                f"{corretora}: HTTP {resposta.status_code}"
+                f"{nome}: HTTP {resposta.status_code}"
             )
 
         try:
-            dados = resposta.json()
+            return resposta.json()
         except ValueError:
             raise ValueError(
-                f"{corretora}: resposta não é JSON válido"
+                f"{nome}: resposta JSON inválida"
             )
-
-        return dados
 
     except requests.RequestException as erro:
         raise ValueError(
-            f"{corretora}: falha de conexão: {erro}"
+            f"{nome}: falha de conexão ({erro})"
         )
 
-def consultar_binance(moeda):
-    dados = consultar_json(
-        "https://api.binance.com/api/v3/ticker/bookTicker",
-        {"symbol": moeda},
-        "Binance"
+def consultar_kraken(par):
+    dados = buscar_json(
+        "https://api.kraken.com/0/public/Ticker",
+        {"pair": par},
+        "Kraken"
     )
 
-    if not isinstance(dados, dict):
-        raise ValueError("Binance: formato inesperado")
-
-    if "askPrice" not in dados or "bidPrice" not in dados:
+    if dados.get("error"):
         raise ValueError(
-            "Binance: preços indisponíveis ou API bloqueada"
+            "Kraken: " + str(dados["error"])
         )
 
+    resultado = dados.get("result", {})
+
+    if not resultado:
+        raise ValueError(
+            "Kraken: cotação indisponível"
+        )
+
+    ticker = next(iter(resultado.values()))
+
     return {
-        "ask": float(dados["askPrice"]),
-        "bid": float(dados["bidPrice"])
+        "ask": float(ticker["a"][0]),
+        "bid": float(ticker["b"][0])
     }
 
-def consultar_bybit(moeda):
-    dados = consultar_json(
-        "https://api.bybit.com/v5/market/tickers",
-        {"category": "spot", "symbol": moeda},
-        "Bybit"
+def consultar_coinbase(par):
+    dados = buscar_json(
+        "https://api.exchange.coinbase.com/products/"
+        + par + "/ticker",
+        None,
+        "Coinbase"
     )
 
-    if not isinstance(dados, dict):
-        raise ValueError("Bybit: formato inesperado")
+    return {
+        "ask": float(dados["ask"]),
+        "bid": float(dados["bid"])
+    }
 
-    if dados.get("retCode") != 0:
+def consultar_mercado(moeda, corretora, par):
+    if corretora == "Kraken":
+        precos = consultar_kraken(par)
+    else:
+        precos = consultar_coinbase(par)
+
+    if precos["ask"] <= 0 or precos["bid"] <= 0:
         raise ValueError(
-            f"Bybit: {dados.get('retMsg', 'Erro na API')}"
+            f"{corretora}: preço inválido"
         )
 
-    lista = dados.get("result", {}).get("list", [])
+    if precos["ask"] < precos["bid"]:
+        raise ValueError(
+            f"{corretora}: preços inconsistentes"
+        )
 
-    if not lista:
-        raise ValueError("Bybit: cotação não encontrada")
-
-    return {
-        "ask": float(lista[0]["ask1Price"]),
-        "bid": float(lista[0]["bid1Price"])
-    }
+    return moeda, corretora, precos
 
 st.subheader("🔎 Monitoramento de mercado")
 
-moedas = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+tarefas = []
 
-resultados = []
-erros = []
+for moeda, corretoras in MOEDAS.items():
+    for corretora, par in corretoras.items():
+        tarefas.append((moeda, corretora, par))
+
+cotacoes = {}
+diagnosticos = []
 
 with st.spinner("Consultando corretoras..."):
-    for moeda in moedas:
-        precos = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futuros = [
+            executor.submit(
+                consultar_mercado,
+                moeda,
+                corretora,
+                par
+            )
+            for moeda, corretora, par in tarefas
+        ]
 
-        try:
-            precos["Binance"] = consultar_binance(moeda)
-        except (ValueError, KeyError, TypeError) as erro:
-            erros.append(f"{moeda} | {erro}")
+        for tarefa, futuro in zip(tarefas, futuros):
+            moeda, corretora, par = tarefa
 
-        try:
-            precos["Bybit"] = consultar_bybit(moeda)
-        except (ValueError, KeyError, TypeError) as erro:
-            erros.append(f"{moeda} | {erro}")
+            try:
+                _, _, precos = futuro.result()
+                cotacoes[(moeda, corretora)] = precos
 
-        if len(precos) != 2:
+                diagnosticos.append({
+                    "Moeda": moeda,
+                    "Corretora": corretora,
+                    "Status": "Conectada"
+                })
+
+            except (
+                ValueError,
+                KeyError,
+                TypeError,
+                IndexError,
+                StopIteration
+            ) as erro:
+                diagnosticos.append({
+                    "Moeda": moeda,
+                    "Corretora": corretora,
+                    "Status": str(erro)
+                })
+
+resultados = []
+
+for moeda in MOEDAS:
+    for origem, destino in [
+        ("Kraken", "Coinbase"),
+        ("Coinbase", "Kraken")
+    ]:
+        if (
+            (moeda, origem) not in cotacoes
+            or (moeda, destino) not in cotacoes
+        ):
             continue
 
-        for origem, destino in [
-            ("Binance", "Bybit"),
-            ("Bybit", "Binance")
-        ]:
-            compra = precos[origem]["ask"]
-            venda = precos[destino]["bid"]
+        compra = cotacoes[(moeda, origem)]["ask"]
+        venda = cotacoes[(moeda, destino)]["bid"]
 
-            if compra <= 0 or venda <= 0:
-                continue
+        quantidade = (
+            capital / compra
+        ) * (1 - taxa_compra / 100)
 
-            quantidade = (
-                capital / compra
-            ) * (1 - taxa_compra / 100)
+        recebido = (
+            quantidade * venda
+        ) * (1 - taxa_venda / 100)
 
-            recebido = (
-                quantidade * venda
-            ) * (1 - taxa_venda / 100)
+        resultado = recebido - capital
+        percentual = resultado / capital * 100
 
-            lucro = recebido - capital
-            retorno = (lucro / capital) * 100
+        resultados.append({
+            "Moeda": moeda,
+            "Comprar": origem,
+            "Vender": destino,
+            "Compra": round(compra, 6),
+            "Venda": round(venda, 6),
+            "Resultado (USDT)": round(resultado, 4),
+            "Retorno (%)": round(percentual, 3)
+        })
 
-            resultados.append({
-                "Moeda": moeda,
-                "Comprar": origem,
-                "Vender": destino,
-                "Compra (USDT)": round(compra, 6),
-                "Venda (USDT)": round(venda, 6),
-                "Resultado estimado (USDT)": round(lucro, 4),
-                "Retorno (%)": round(retorno, 3)
-            })
+st.subheader("📊 Comparação de arbitragem")
 
 if resultados:
     resultados.sort(
@@ -187,34 +246,56 @@ if resultados:
     )
 
     positivas = sum(
-        1 for item in resultados
-        if item["Resultado estimado (USDT)"] > 0
+        item["Resultado (USDT)"] > 0
+        for item in resultados
     )
 
     st.metric(
         "Diferenças positivas estimadas",
         positivas
     )
-else:
-    st.info(
-        "Ainda não foi possível comparar as duas corretoras."
+
+    melhor = resultados[0]
+
+    st.metric(
+        "Maior retorno estimado",
+        f"{melhor['Retorno (%)']:.3f}%"
     )
 
-if erros:
-    with st.expander("⚠️ Diagnóstico das conexões", expanded=True):
-        for erro in erros:
-            st.error(erro)
+else:
+    st.info(
+        "Não foi possível comparar as duas "
+        "corretoras neste momento."
+    )
+
+st.subheader("🌐 Diagnóstico das conexões")
+
+for item in diagnosticos:
+    descricao = (
+        f"{item['Moeda']} | "
+        f"{item['Corretora']} — "
+        f"{item['Status']}"
+    )
+
+    if item["Status"] == "Conectada":
+        st.success(descricao)
+    else:
+        st.error(descricao)
 
 st.info(
-    "Os cálculos são indicativos. Não consideram "
-    "profundidade do livro, slippage, transferências, "
-    "latência nem garantia de execução. "
+    "As diferenças são estimativas baseadas "
+    "nas melhores ofertas disponíveis. "
+    "Não consideram profundidade do livro, "
+    "slippage, transferências, latência "
+    "ou execução simultânea. "
     "Não representam lucro realizado."
 )
 
 st.caption(
-    "Consulta realizada em: "
-    + datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    "Última consulta (UTC): "
+    + datetime.now(timezone.utc).strftime(
+        "%d/%m/%Y %H:%M:%S"
+    )
 )
 
 if st.button("🔄 Atualizar cotações"):
